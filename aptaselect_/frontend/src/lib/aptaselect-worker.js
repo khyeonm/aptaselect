@@ -1,24 +1,62 @@
 // AptaSelect 워커 - 시퀀스 조인 및 3단계 필터링 처리
 import { FastqChunker } from './fastq-chunker.js';
+import { run_fastq_join } from './fastq-join.js';
 
 class AptaSelectProcessor {
     constructor() {
         this.chunker = new FastqChunker();
     }
 
-    // 두 시퀀스를 조인하는 함수
-    joinSequences(record1, record2, isShort = true) {
-        if (isShort) {
-            // Short library: 단순 연결
-            return {
-                seq: record1.seq + record2.seq,
-                qual: record1.qual + record2.qual,
-                id: record1.id
+    // CLAUDE.md 가이드라인: run_fastq_join 함수 사용하는 청크 단위 조인
+    async runFastqJoinOnChunk(file1Data, file2Data, is_short) {
+        // 1. FASTQ 레코드 배열을 FASTQ 문자열로 변환
+        const file1String = this.convertRecordsToFastqString(file1Data);
+        const file2String = this.convertRecordsToFastqString(file2Data);
+        
+        // 2. Blob으로 변환하여 File 객체 생성
+        const file1Blob = new Blob([file1String], {type: 'text/plain'});
+        const file2Blob = new Blob([file2String], {type: 'text/plain'});
+        const tempFiles = [
+            new File([file1Blob], 'temp1.fq'), 
+            new File([file2Blob], 'temp2.fq')
+        ];
+        
+        // 3. run_fastq_join 호출
+        return new Promise((resolve, reject) => {
+            const joinedSequences = [];
+            
+            const pgCallback = (progress) => {
+                // 청크 단위에서는 진행률 콜백 무시
             };
-        } else {
-            // Long library: overlap 찾아서 조인
-            return this.findOverlapAndJoin(record1, record2);
-        }
+            
+            const chunkCallback = (joins) => {
+                // join 결과를 수집
+                joinedSequences.push(...joins);
+            };
+            
+            try {
+                console.log(`🔗 run_fastq_join 실행 시작 (${file1Data.length}개 레코드, is_short: ${is_short})`);
+                
+                // run_fastq_join 매개변수: (files, pgcallback, chunkcallback, reverse, mino, pctdiff)
+                // is_short=true면 reverse=false (순서 그대로), is_short=false면 reverse=true (역순)
+                const reverse = !is_short;
+                run_fastq_join(tempFiles, pgCallback, chunkCallback, reverse, 6, 8);
+                
+                console.log(`✅ run_fastq_join 완료 (${joinedSequences.length}개 조인 시퀀스)`);
+                resolve(joinedSequences);
+                
+            } catch (error) {
+                console.error(`❌ run_fastq_join 오류:`, error);
+                reject(error);
+            }
+        });
+    }
+    
+    // FASTQ 레코드 배열을 FASTQ 문자열로 변환하는 헬퍼 함수
+    convertRecordsToFastqString(records) {
+        return records.map(record => 
+            `${record.id}\n${record.seq}\n${record.comment || '+'}\n${record.qual}`
+        ).join('\n') + '\n';
     }
 
     // Overlap을 찾아서 시퀀스를 조인하는 함수 (기존 fastq-join 로직 적용)
@@ -200,16 +238,27 @@ class AptaSelectProcessor {
 
         console.log(`청크 처리 시작: ${file1Records.length}개 레코드`);
 
-        // 1단계: 시퀀스 조인
-        const joinedSequences = [];
+        // 1단계: 시퀀스 조인 (CLAUDE.md 가이드라인: run_fastq_join 사용)
         const minRecords = Math.min(file1Records.length, file2Records.length);
+        const trimmedFile1Records = file1Records.slice(0, minRecords);
+        const trimmedFile2Records = file2Records.slice(0, minRecords);
         
-        for (let i = 0; i < minRecords; i++) {
-            const joined = this.joinSequences(file1Records[i], file2Records[i], isShort);
-            joinedSequences.push(joined);
-        }
+        const rawJoinedSequences = await this.runFastqJoinOnChunk(
+            trimmedFile1Records, 
+            trimmedFile2Records, 
+            isShort
+        );
+        
+        // run_fastq_join 결과를 필터링에 맞는 형태로 변환
+        const joinedSequences = rawJoinedSequences.map((seq, index) => ({
+            seq: seq,
+            qual: '',
+            id: `joined_${index}`,
+            validated: true,
+            recordIndex: index
+        }));
 
-        console.log(`조인 완료: ${joinedSequences.length}개 시퀀스`);
+        console.log(`조인 완료: ${joinedSequences.length}개 시퀀스 (run_fastq_join 사용)`);
 
         // 2단계: 선택 필터링
         const selectedSequences = this.filterSequences(

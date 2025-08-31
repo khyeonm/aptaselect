@@ -1,13 +1,21 @@
-// AptaSelect 메인 컨트롤러 - 카운트 집계 및 실시간 업데이트
+// AptaSelect 메인 컨트롤러 - Pull 기반 파이프라인 지원
 import { FastqChunker } from './fastq-chunker.js';
 import { WorkerPool } from './worker-pool.js';
 import { DuckDBProcessor } from './duckdb-processor.js';
+import { PullBasedAptaSelectController } from './pull-based-aptaselect-controller.js';
 
 export class AptaSelectController {
     constructor() {
+        // 기존 방식과 새로운 Pull 기반 방식 지원
+        this.usePullBasedProcessing = true; // 기본적으로 Pull 기반 사용
+        
+        // 기존 구성 요소들 (호환성 유지)
         this.chunker = new FastqChunker();
         this.workerPool = null;
         this.duckDB = new DuckDBProcessor();
+        
+        // Pull 기반 컨트롤러
+        this.pullBasedController = null;
         
         // 카운트 집계
         this.counts = {
@@ -44,13 +52,79 @@ export class AptaSelectController {
         this.workerCounts = new Map(); // 워커별 카운트 추적
     }
 
-    // 분석 시작
+    // 분석 시작 - Pull 기반 또는 기존 방식 선택
     async startAnalysis(files, analysisParams) {
+        if (this.usePullBasedProcessing) {
+            return this.startPullBasedAnalysis(files, analysisParams);
+        } else {
+            return this.startLegacyAnalysis(files, analysisParams);
+        }
+    }
+    
+    // Pull 기반 분석 시작
+    async startPullBasedAnalysis(files, analysisParams) {
+        try {
+            console.log('🚀 Pull 기반 AptaSelect 분석 시작');
+            
+            // Pull 기반 컨트롤러 초기화
+            this.pullBasedController = new PullBasedAptaSelectController();
+            
+            // 콜백 설정
+            this.pullBasedController.onProgressUpdate = (progressInfo) => {
+                this.progress = progressInfo;
+                if (this.onProgressUpdate) {
+                    this.onProgressUpdate(progressInfo);
+                }
+            };
+            
+            this.pullBasedController.onCountUpdate = (counts) => {
+                this.counts = counts;
+                if (this.onCountUpdate) {
+                    this.onCountUpdate(counts);
+                }
+            };
+            
+            this.pullBasedController.onComplete = (finalCounts) => {
+                this.counts = finalCounts;
+                this.isProcessing = false;
+                console.log('🎉 Pull 기반 분석 완료:', finalCounts);
+                
+                if (this.onComplete) {
+                    this.onComplete(finalCounts);
+                }
+            };
+            
+            this.pullBasedController.onError = (error) => {
+                this.isProcessing = false;
+                console.error('Pull 기반 분석 오류:', error);
+                if (this.onError) {
+                    this.onError(error);
+                }
+            };
+            
+            // 분석 시작
+            this.isProcessing = true;
+            this.pullBasedController.files = files;
+            this.pullBasedController.analysisParams = analysisParams;
+            
+            await this.pullBasedController.startOptimizedAnalysis(files, analysisParams);
+            
+        } catch (error) {
+            this.isProcessing = false;
+            console.error('Pull 기반 분석 시작 오류:', error);
+            if (this.onError) {
+                this.onError(error);
+            }
+        }
+    }
+    
+    // 기존 방식 분석 (호환성 유지)
+    async startLegacyAnalysis(files, analysisParams) {
         try {
             this.isProcessing = true;
             this.resetCounts();
             
-            console.log('AptaSelect 분석 시작');
+            console.log('기존 방식 AptaSelect 분석 시작');
             
             // 1단계: 파일 청킹 (진행률 콜백 추가)
             this.updateProgress('chunking', 0);
@@ -339,7 +413,10 @@ export class AptaSelectController {
     async stopAnalysis() {
         this.isProcessing = false;
         
-        if (this.workerPool) {
+        if (this.usePullBasedProcessing && this.pullBasedController) {
+            await this.pullBasedController.stopAnalysis();
+            this.pullBasedController = null;
+        } else if (this.workerPool) {
             this.workerPool.terminate();
             this.workerPool = null;
         }
@@ -350,13 +427,17 @@ export class AptaSelectController {
     // 전체 시퀀스 데이터 조회 (다운로드용)
     async getAllSequencesForDownload() {
         try {
-            // 메모리에서 전체 시퀀스와 카운트 데이터 조회
-            const allSequences = this.getTopSequencesFromMap('sorted2', -1); // -1은 전체를 의미
-            
-            console.log(`다운로드용 전체 시퀀스 조회 완료: ${allSequences.length}개`);
-            console.log('첫 5개 시퀀스 샘플:', allSequences.slice(0, 5));
-            
-            return allSequences;
+            if (this.usePullBasedProcessing && this.pullBasedController) {
+                return await this.pullBasedController.getAllSequencesForDownload();
+            } else {
+                // 기존 방식: 메모리에서 전체 시퀀스와 카운트 데이터 조회
+                const allSequences = this.getTopSequencesFromMap('sorted2', -1); // -1은 전체를 의미
+                
+                console.log(`다운로드용 전체 시퀀스 조회 완료: ${allSequences.length}개`);
+                console.log('첫 5개 시퀀스 샘플:', allSequences.slice(0, 5));
+                
+                return allSequences;
+            }
 
         } catch (error) {
             console.error('전체 시퀀스 조회 오류:', error);
@@ -366,13 +447,18 @@ export class AptaSelectController {
 
     // 상태 조회
     getStatus() {
-        return {
-            isProcessing: this.isProcessing,
-            progress: this.progress,
-            counts: this.counts,
-            totalChunks: this.totalChunks,
-            processedChunks: this.processedChunks,
-            workerPoolStatus: this.workerPool ? this.workerPool.getStatus() : null
-        };
+        if (this.usePullBasedProcessing && this.pullBasedController) {
+            return this.pullBasedController.getStatus();
+        } else {
+            return {
+                isProcessing: this.isProcessing,
+                progress: this.progress,
+                counts: this.counts,
+                totalChunks: this.totalChunks,
+                processedChunks: this.processedChunks,
+                workerPoolStatus: this.workerPool ? this.workerPool.getStatus() : null,
+                processingMode: 'legacy'
+            };
+        }
     }
 }
