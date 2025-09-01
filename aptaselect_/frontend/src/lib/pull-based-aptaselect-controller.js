@@ -47,6 +47,10 @@ export class PullBasedAptaSelectController {
         this.availableWorkers = [];
         this.busyWorkers = new Set();
         
+        // 공유 큐 관리 (폴백용)
+        this.sharedChunkInfoQueue = [];  // 위치 정보 공유 큐
+        this.queueLock = false;          // 동시성 제어용 락
+        
         // 🔧 워커 완료 신호 누락 문제 해결: 청크 기반 완료 추적
         this.chunkCompletionMap = new Map(); // 청크ID -> 완료상태
         this.lastChunkProcessedTime = Date.now();
@@ -59,7 +63,7 @@ export class PullBasedAptaSelectController {
         this.workerStates = new Map(); // workerId -> 워커 상태 정보
     }
     
-    // 청크를 가용한 워커에게 배분
+    // 청크를 가용한 워커에게 배분 (폴백 모드에서만 사용)
     distributeChunkToWorker(chunkInfo) {
         // 가용한 워커 찾기
         let availableWorker = null;
@@ -81,12 +85,12 @@ export class PullBasedAptaSelectController {
                 chunkInfo: chunkInfo
             });
             
-            console.log(`📤 청크 ${chunkInfo.chunkId}을 워커 ${availableWorker}에게 할당`);
+            console.log(`📤 폴백: 청크 ${chunkInfo.chunkId}을 워커 ${availableWorker}에게 할당`);
         } else {
             // 모든 워커가 바쁜 경우 나중에 처리하기 위해 큐에 저장
             if (!this.pendingChunks) this.pendingChunks = [];
             this.pendingChunks.push(chunkInfo);
-            console.log(`⏳ 청크 ${chunkInfo.chunkId} 대기 큐에 추가`);
+            console.log(`⏳ 폴백: 청크 ${chunkInfo.chunkId} 대기 큐에 추가`);
         }
     }
 
@@ -155,23 +159,54 @@ export class PullBasedAptaSelectController {
     handleChunkingWorkerMessage(event) {
         const { type } = event.data;
         
-        if (type === 'queue_ready') {
-            console.log('📋 큐 준비 완료, 처리 워커들에게 알림');
+        if (type === 'shared_queue_ready') {
+            const { sharedBuffer } = event.data;
             
-            // 모든 처리 워커에게 분석 매개변수 전달
+            console.log('📋 SharedArrayBuffer 공유 큐 준비 완료, 처리 워커들에게 전달');
+            
+            // SharedArrayBuffer Pull 기반 워커 시작
             this.processingWorkers.forEach((worker, index) => {
                 worker.postMessage({
                     type: 'start_processing',
                     workerId: index,
-                    files: [this.files[0], this.files[1]], // File 객체 전달
-                    analysisParams: this.analysisParams
+                    files: [this.files[0], this.files[1]],
+                    analysisParams: this.analysisParams,
+                    sharedBuffer: sharedBuffer,
+                    mode: 'pull' // Pull 모드 명시
                 });
                 
-                console.log(`👷 워커 ${index} 시작됨`);
+                console.log(`👷 Pull 기반 워커 ${index} 시작됨 (SharedArrayBuffer)`);
             });
             
+        } else if (type === 'fallback_queue_ready') {
+            console.log('📋 폴백 큐 준비 완료, 실시간 Pull 방식 (BroadcastChannel) 시작');
+            
+            // 폴백: BroadcastChannel 기반 Pull 워커 시작
+            this.processingWorkers.forEach((worker, index) => {
+                worker.postMessage({
+                    type: 'start_processing',
+                    workerId: index,
+                    files: [this.files[0], this.files[1]],
+                    analysisParams: this.analysisParams,
+                    mode: 'pull_fallback' // Pull 폴백 모드 명시
+                });
+                
+                console.log(`👷 Pull 기반 워커 ${index} 시작됨 (BroadcastChannel 폴백)`);
+            });
+            
+        } else if (type === 'chunk_ready_for_assignment') {
+            // ✅ 청크 위치 정보 완성 즉시 공유 큐에 추가
+            const { chunkInfo } = event.data;
+            console.log(`⚡ 청킹 워커에서 청크 위치 정보 수신:`, chunkInfo);
+            if (chunkInfo && chunkInfo.chunkId !== undefined) {
+                console.log(`✅ 유효한 청크 정보 ${chunkInfo.chunkId} - 공유 큐에 추가`);
+                this.addChunkInfoToSharedQueue(chunkInfo);
+            } else {
+                console.error(`❌ 청킹 워커에서 잘못된 청크 정보:`, chunkInfo);
+            }
+            
         } else if (type === 'chunk_available') {
-            // 청크가 준비되었을 때 처리 워커에게 전달
+            // 폴백 모드에서만 개별 청크 전송 처리
             const { chunkInfo } = event.data;
             this.distributeChunkToWorker(chunkInfo);
             
@@ -204,7 +239,7 @@ export class PullBasedAptaSelectController {
     }
     
     // 처리 워커 메시지 핸들러
-    handleWorkerMessage(event, workerId) {
+    async handleWorkerMessage(event, workerId) {
         const { type, data } = event.data;
         
         if (type === 'chunk_processed') {
@@ -236,6 +271,22 @@ export class PullBasedAptaSelectController {
         } else if (type === 'worker_heartbeat') {
             // 💓 워커 하트비트 처리
             this.handleWorkerHeartbeat(event.data);
+            
+        } else if (type === 'pull_request') {
+            // ⚙️ 워커가 직접 Pull 요청 (진정한 Pull 방식)
+            console.log(`📨 워커 ${workerId}: Pull 요청 수신`);
+            try {
+                await this.handleWorkerPullRequest(workerId);
+                console.log(`✅ 워커 ${workerId}: Pull 요청 처리 완료`);
+            } catch (error) {
+                console.error(`❌ 워커 ${workerId}: Pull 요청 처리 오류:`, error);
+            }
+            
+        } else if (type === 'chunk_ready_for_assignment') {
+            // ⚙️ 청크 위치 정보 완성 즉시 공유 큐에 추가
+            const { chunkInfo } = event.data;
+            console.log(`⚡ 청크 위치 정보 ${chunkInfo.chunkId} 수신 - 공유 큐에 즉시 추가`);
+            this.addChunkInfoToSharedQueue(chunkInfo);
         }
     }
     
@@ -277,14 +328,11 @@ export class PullBasedAptaSelectController {
             
             console.log(`📊 청크 ${chunkId} (워커 ${workerId}) 처리 완료 (${this.processedChunks}/${this.totalChunks}, 완료 추적: ${this.chunkCompletionMap.size})`);
             
-            // 워커를 다시 사용 가능하게 설정
-            this.busyWorkers.delete(workerId);
+            // 🔧 Pull 기반: 워커가 스스로 다음 작업 찾으므로 별도 할당 불필요
+            // 워커는 처리 완료 후 자동으로 큐에서 다음 청크 가져감
+            console.log(`🔄 Pull 기반: 워커 ${workerId} 자동으로 다음 작업 처리 예정`);
             
-            // 대기 중인 청크가 있으면 할당
-            if (this.pendingChunks && this.pendingChunks.length > 0) {
-                const nextChunk = this.pendingChunks.shift();
-                this.distributeChunkToWorker(nextChunk);
-            }
+            // 더 이상 busyWorkers나 pendingChunks 관리 불필요
             
             // 🔧 완료 상태 확인 (청크 기반 완료 추적 사용)
             if (this.chunkingComplete && this.allChunksCompleted()) {
@@ -311,6 +359,75 @@ export class PullBasedAptaSelectController {
         }
         
         return result;
+    }
+    
+    // ⚙️ 공유 큐에 청크 위치 정보 추가 (폴백 모드 실시간 스트리밍)
+    async addChunkInfoToSharedQueue(chunkInfo) {
+        // 동시성 제어
+        while (this.queueLock) {
+            await new Promise(resolve => setTimeout(resolve, 1));
+        }
+        this.queueLock = true;
+        
+        try {
+            this.sharedChunkInfoQueue.push(chunkInfo);
+            console.log(`📍 청크 위치 정보 ${chunkInfo.chunkId} 공유 큐에 추가`);
+            console.log(`   📈 공유 큐 크기: ${this.sharedChunkInfoQueue.length}개 위치 정보`);
+            console.log(`   📍 내용: FASTQ1 ${chunkInfo.file1StartPos}, FASTQ2 ${chunkInfo.file2StartPos}, ${chunkInfo.recordCount}개 레코드`);
+        } finally {
+            this.queueLock = false;
+        }
+    }
+    
+    // ⚙️ 워커 Pull 요청 처리 (진정한 Pull 방식)
+    async handleWorkerPullRequest(workerId) {
+        console.log(`📨 워커 ${workerId} Pull 요청 처리 시작 (큐 크기: ${this.sharedChunkInfoQueue.length})`);
+        
+        const chunkInfo = await this.dequeueChunkInfo();
+        const worker = this.processingWorkers[workerId];
+        
+        if (chunkInfo) {
+            // Pull 요청한 워커에게 위치 정보 전송
+            console.log(`✅ 워커 ${workerId}에게 청크 정보 전송:`, chunkInfo);
+            worker.postMessage({
+                type: 'chunk_info_response',
+                workerId: workerId,
+                chunkInfo: chunkInfo
+            });
+            
+            console.log(`🔽 워커 ${workerId}: Pull 요청 → 청크 위치 정보 ${chunkInfo.chunkId} 제공`);
+            
+        } else {
+            // 큐가 비어있음을 알림
+            worker.postMessage({
+                type: 'queue_empty',
+                workerId: workerId
+            });
+            
+            console.log(`💤 워커 ${workerId}: Pull 요청 → 큐 비어있음 알림`);
+        }
+    }
+    
+    // ⚙️ 공유 큐에서 청크 위치 정보 추출 (원자적 연산)
+    async dequeueChunkInfo() {
+        while (this.queueLock) {
+            await new Promise(resolve => setTimeout(resolve, 1));
+        }
+        this.queueLock = true;
+        
+        let chunkInfo = null;
+        try {
+            if (this.sharedChunkInfoQueue.length > 0) {
+                chunkInfo = this.sharedChunkInfoQueue.shift();
+                console.log(`🔽 공유 큐에서 청크 위치 정보 ${chunkInfo.chunkId} 추출 (남은: ${this.sharedChunkInfoQueue.length})`);
+            } else {
+                console.log(`💤 공유 큐가 비어있음 (큐 크기: ${this.sharedChunkInfoQueue.length})`);
+            }
+        } finally {
+            this.queueLock = false;
+        }
+        
+        return chunkInfo;
     }
     
     // 💓 워커 하트비트 처리
@@ -402,9 +519,8 @@ export class PullBasedAptaSelectController {
     // 🔧 모든 워커 완료 확인 (다중 완료 감지 메커니즘)
     checkAllWorkersComplete() {
         const now = Date.now();
-        const allWorkersIdle = this.busyWorkers.size === 0;
+        // 🔧 Pull 기반에서는 busyWorkers, pendingChunks 사용하지 않음
         const chunkingFinished = this.chunkingComplete;
-        const noMoreChunks = !this.pendingChunks || this.pendingChunks.length === 0;
         const allChunksProcessed = this.totalChunks && this.processedChunks >= this.totalChunks;
         const allWorkersCompleted = this.completedWorkers.size >= this.processingWorkers.length;
         
@@ -413,25 +529,18 @@ export class PullBasedAptaSelectController {
         const noProgressFor10Seconds = this.lastProgressTime && (now - this.lastProgressTime) > 10000;
         const noChunkProcessedFor5Seconds = this.lastChunkProcessedTime && (now - this.lastChunkProcessedTime) > 5000;
         
-        // 워커 유휴 상태 시간 추적
-        if (allWorkersIdle && chunkingFinished && noMoreChunks) {
-            if (!this.allWorkersIdleTime) {
-                this.allWorkersIdleTime = now;
-                console.log('💤 모든 워커 유휴 상태 시작 시점 기록');
-            }
-        } else {
-            this.allWorkersIdleTime = null;
-        }
+        // 🔧 Pull 기반에서는 워커 유휴 상태를 하트비트로 추적
+        // 모든 워커가 하트비트에서 isIdle=true, queueEmpty=true 보고하는지 확인
+        const allWorkersReportIdle = this.allWorkersReportIdle();
         
-        const allWorkersIdleFor5Seconds = this.allWorkersIdleTime && (now - this.allWorkersIdleTime) > 5000;
+        const allWorkersIdleFor5Seconds = allWorkersReportIdle && this.noProgressFor5Seconds();
         
         // 🔧 하트비트 기반 완료 감지
         const heartbeatBasedCompletion = this.allWorkersReportIdle() && chunkingFinished && this.noProgressFor5Seconds();
         
-        console.log(`🔍 워커 완료 상태 상세 확인:`);
+        console.log(`🔍 Pull 기반 워커 완료 상태 상세 확인:`);
         console.log(`   • 청킹 완료: ${chunkingFinished}`);
-        console.log(`   • 바쁜 워커: ${this.busyWorkers.size}/${this.processingWorkers.length}`);
-        console.log(`   • 대기 청크: ${this.pendingChunks?.length || 0}개`);
+        console.log(`   • 하트비트 워커 유휴: ${allWorkersReportIdle} (${this.workerStates.size}/${this.processingWorkers.length})`);
         console.log(`   • 처리된 청크: ${this.processedChunks}/${this.totalChunks || 'unknown'}`);
         console.log(`   • 완료 추적된 청크: ${this.chunkCompletionMap.size}/${this.totalChunks || 'unknown'}`);
         console.log(`   • 완료된 워커: ${this.completedWorkers.size}/${this.processingWorkers.length}`);
@@ -449,13 +558,13 @@ export class PullBasedAptaSelectController {
         } else if (heartbeatBasedCompletion) {
             console.log('🎉 완료 조건C: 하트비트 기반 완료 감지');
             this.finalizeResults();
-        } else if (allChunksProcessed && chunkingFinished && allWorkersIdle) {
-            console.log('🎉 완료 조건D: 모든 청크 처리 + 워커 유휴');
+        } else if (allChunksProcessed && chunkingFinished && allWorkersReportIdle) {
+            console.log('🎉 완료 조건D: 모든 청크 처리 + 워커 유휴 (하트비트)');
             this.finalizeResults();
-        } else if (chunkingFinished && allWorkersIdle && noMoreChunks && allWorkersIdleFor5Seconds) {
-            console.log('🎉 완료 조건E: 5초간 워커 유휴 상태');
+        } else if (chunkingFinished && allWorkersIdleFor5Seconds) {
+            console.log('🎉 완료 조건E: 5초간 워커 유휴 상태 (하트비트)');
             this.finalizeResults();
-        } else if (chunkingFinished && allWorkersIdle && noMoreChunks && noChunkProcessedFor5Seconds) {
+        } else if (chunkingFinished && allWorkersReportIdle && noChunkProcessedFor5Seconds) {
             console.log('🎉 완료 조건F: 5초간 청크 처리 없음');
             this.finalizeResults();
         } else {
@@ -565,7 +674,7 @@ export class PullBasedAptaSelectController {
         // 추가 정보 계산 (CLAUDE.md 개선사항 포함)
         const progressInfo = {
             ...this.progress,
-            busyWorkers: this.busyWorkers.size,
+            busyWorkers: this.getActiveWorkersCount(), // Pull 기반에서는 하트비트로 계산
             totalWorkers: this.processingWorkers.length,
             processedChunks: this.processedChunks,
             totalChunks: this.totalChunks || 'unknown',
@@ -683,6 +792,65 @@ export class PullBasedAptaSelectController {
         return noProgress;
     }
     
+    getActiveWorkersCount() {
+        // Pull 기반에서는 하트비트 정보로 활성 워커 수 계산
+        let activeWorkers = 0;
+        for (const [workerId, state] of this.workerStates) {
+            if (!state.isIdle || !state.queueEmpty) {
+                activeWorkers++;
+            }
+        }
+        return activeWorkers;
+    }
+    
+    // 공유 큐에 위치 정보 추가
+    async addChunkInfoToSharedQueue(chunkInfo) {
+        // 동시성 제어 (여러 청킹 워커가 동시에 추가할 수 있음)
+        while (this.queueLock) {
+            await new Promise(resolve => setTimeout(resolve, 1));
+        }
+        this.queueLock = true;
+        
+        this.sharedChunkInfoQueue.push(chunkInfo);
+        console.log(`📋 청크 위치 정보 ${chunkInfo.chunkId} 공유 큐에 추가`);
+        console.log(`   📊 공유 큐 크기: ${this.sharedChunkInfoQueue.length}개 위치 정보`);
+        
+        this.queueLock = false;
+    }
+    
+    // 워커가 Pull 요청할 때 호출되는 메서드
+    async handleWorkerPullRequest(workerId) {
+        const chunkInfo = await this.dequeueChunkInfo();
+        const worker = this.processingWorkers[workerId];
+        
+        if (chunkInfo) {
+            // ✅ Pull 요청한 워커에게 위치 정보 전송
+            worker.postMessage({
+                type: 'chunk_info_response',
+                chunkInfo: chunkInfo
+            });
+            console.log(`🔽 워커 ${workerId}: Pull 요청 → 청크 위치 정보 ${chunkInfo.chunkId} 제공`);
+        } else {
+            // 큐가 비어있음을 알림
+            worker.postMessage({
+                type: 'queue_empty'
+            });
+        }
+    }
+    
+    // 공유 큐에서 위치 정보 추출
+    async dequeueChunkInfo() {
+        while (this.queueLock) {
+            await new Promise(resolve => setTimeout(resolve, 1));
+        }
+        this.queueLock = true;
+        
+        const chunkInfo = this.sharedChunkInfoQueue.shift();
+        this.queueLock = false;
+        
+        return chunkInfo;
+    }
+    
     // 상태 조회
     getStatus() {
         return {
@@ -693,7 +861,8 @@ export class PullBasedAptaSelectController {
             processedChunks: this.processedChunks,
             activeWorkers: this.processingWorkers.length,
             completedWorkers: this.completedWorkers.size,
-            cpuCores: navigator.hardwareConcurrency || 'unknown'
+            cpuCores: navigator.hardwareConcurrency || 'unknown',
+            queueSize: this.sharedChunkInfoQueue.length // 큐 크기 추가
         };
     }
 }

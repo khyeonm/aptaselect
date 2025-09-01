@@ -14,6 +14,42 @@ class PullBasedProcessingWorker {
         this.isIdle = true;
         this.queueEmpty = true;
         this.heartbeatInterval = null;
+        this.sharedQueue = null;
+        
+        // BroadcastChannel 기반 큐 알림 시스템
+        this.queueChannel = new BroadcastChannel('chunk-queue');
+        this.setupBroadcastListener();
+    }
+    
+    // BroadcastChannel 리스너 설정
+    setupBroadcastListener() {
+        this.queueChannel.addEventListener('message', (event) => {
+            if (event.data.type === 'queue_item_added' && !this.isProcessing) {
+                console.log(`📻 워커 ${this.workerId}: 큐 추가 알림 수신 → 즉시 Pull 시도`);
+                this.attemptPull();
+            }
+        });
+        console.log('📻 BroadcastChannel 리스너 설정 완료');
+    }
+    
+    // 즉시 Pull 시도
+    async attemptPull() {
+        if (this.isProcessing) return;  // 이미 처리 중이면 무시
+        
+        console.log(`⚡ 워커 ${this.workerId}: 브로드캐스트 알림으로 즉시 Pull 시도`);
+        
+        // 기존 dequeueChunk 메서드 사용
+        const chunkInfo = await this.dequeueChunk();
+        
+        if (chunkInfo) {
+            this.isProcessing = true;
+            console.log(`⚡ 워커 ${this.workerId}: 브로드캐스트로 즉시 획득 ${chunkInfo.chunkId}`);
+            await this.processChunkFromQueue(chunkInfo);
+            this.isProcessing = false;
+            
+            // 처리 완료 후 추가 작업이 있는지 확인
+            this.attemptPull();
+        }
     }
     
     // 하트비트 시작
@@ -58,7 +94,7 @@ class PullBasedProcessingWorker {
         
         while (true) {
             // 큐에서 청크 가져오기
-            const chunkInfo = this.dequeueChunk();
+            const chunkInfo = await this.dequeueChunk();
             
             if (chunkInfo) {
                 // 청크 처리 시작 - 바쁜 상태로 변경
@@ -102,6 +138,11 @@ class PullBasedProcessingWorker {
     
     // 큐에서 가져온 청크 처리
     async processChunkFromQueue(chunkInfo) {
+        if (!chunkInfo || chunkInfo.chunkId === undefined) {
+            console.error(`❌ 워커 ${this.workerId}: 잘못된 청크 정보:`, chunkInfo);
+            return;
+        }
+        
         console.log(`🔧 워커 ${this.workerId}: 청크 ${chunkInfo.chunkId} 처리 시작`);
         
         try {
@@ -217,39 +258,82 @@ class PullBasedProcessingWorker {
         const reader = new jbfilereader(file, false);
         const records = [];
         
-        // 시작 위치로 이동 (간단한 방법: 처음부터 읽어서 건너뛰기)
-        let currentRecords = 0;
-        let targetStartRecord = Math.floor(startPos / 200); // 대략적인 레코드 위치 추정
-        
-        // 첫 번째 청크가 아니면 해당 위치까지 건너뛰기
-        if (targetStartRecord > 0) {
-            for (let i = 0; i < targetStartRecord; i++) {
-                await this.readLine(reader); // id
-                await this.readLine(reader); // seq
-                await this.readLine(reader); // plus
-                await this.readLine(reader); // qual
+        // 해당 위치로 이동 (startPos가 0이 아닐 때만)
+        if (startPos > 0) {
+            reader.fpos = startPos;
+            
+            // 위치가 레코드 중간일 수 있으므로 다음 '@' 헤더 찾기
+            let line = await this.readLine(reader);
+            while (line !== "" && !line.startsWith('@')) {
+                line = await this.readLine(reader);
+            }
+            
+            // '@' 헤더를 찾았으면 해당 라인부터 시작
+            if (line.startsWith('@')) {
+                // 첫 번째 레코드의 ID로 사용
+                records.push(await this.readSingleFastqRecord(reader, line));
             }
         }
         
-        // 실제 레코드 읽기
-        for (let i = 0; i < recordCount; i++) {
-            const record = {
-                id: await this.readLine(reader),
-                seq: await this.readLine(reader),
-                plus: await this.readLine(reader),
-                qual: await this.readLine(reader)
-            };
-            
-            if (record.id === "" || !record.id.startsWith('@')) {
-                break;
-            }
-            
+        // 나머지 레코드들을 정확한 FASTQ 파싱으로 읽기
+        while (records.length < recordCount) {
+            const record = await this.readSingleFastqRecord(reader);
+            if (!record) break; // EOF
             records.push(record);
         }
         
+        console.log(`📖 워커 ${this.workerId}: ${records.length}개 레코드 읽기 완료`);
         return records;
     }
     
+    // 정확한 FASTQ 레코드 파싱 (synchronized-chunking-worker.js와 동일한 로직)
+    async readSingleFastqRecord(reader, headerLine = null) {
+        // 1단계: '@'로 시작하는 헤더 라인 찾기
+        let id = headerLine || await this.readLine(reader);
+        if (id === "") return null; // EOF
+        
+        // '@' 헤더가 아니면 다음 '@' 헤더 찾기
+        while (!id.startsWith('@')) {
+            id = await this.readLine(reader);
+            if (id === "") return null; // EOF
+        }
+        
+        // 2단계: 시퀀스 라인들 모두 읽기 ('+'가 나올 때까지)
+        let sequenceLines = [];
+        let line = await this.readLine(reader);
+        if (line === "") return null; // EOF
+        
+        while (!line.startsWith('+')) {
+            sequenceLines.push(line);
+            line = await this.readLine(reader);
+            if (line === "") return null; // EOF
+        }
+        
+        const plus = line; // '+' 라인
+        const seq = sequenceLines.join(''); // 시퀀스 합치기
+        
+        // 3단계: 품질 점수 라인들 읽기 (시퀀스와 같은 길이까지)
+        const totalSequenceLength = seq.length;
+        let qualityLines = [];
+        let qualityLength = 0;
+        
+        while (qualityLength < totalSequenceLength) {
+            const qualityLine = await this.readLine(reader);
+            if (qualityLine === "") return null; // EOF
+            qualityLines.push(qualityLine);
+            qualityLength += qualityLine.length;
+        }
+        
+        const qual = qualityLines.join(''); // 품질 점수 합치기
+        
+        return {
+            id: id,
+            seq: seq,
+            plus: plus,
+            qual: qual
+        };
+    }
+
     async readLine(reader) {
         return new Promise((resolve) => {
             reader.readline(resolve);
@@ -435,28 +519,80 @@ class PullBasedProcessingWorker {
         const reader = new jbfilereader(file, false);
         const records = [];
         
-        // 해당 위치로 이동
-        reader.fpos = startPos;
+        // 해당 위치로 이동 (startPos가 0이 아닐 때만)
+        if (startPos > 0) {
+            reader.fpos = startPos;
+            
+            // 위치가 레코드 중간일 수 있으므로 다음 '@' 헤더 찾기
+            let line = await this.readLine(reader);
+            while (line !== "" && !line.startsWith('@')) {
+                line = await this.readLine(reader);
+            }
+            
+            // '@' 헤더를 찾았으면 해당 라인부터 시작
+            if (line.startsWith('@')) {
+                // 첫 번째 레코드의 ID로 사용
+                records.push(await this.readSingleFastqRecord(reader, line));
+            }
+        }
         
-        // 지정된 개수만큼 레코드 읽기
-        for (let i = 0; i < recordCount; i++) {
-            const id = await this.readLine(reader);
-            if (id === "") break; // EOF
-            
-            const seq = await this.readLine(reader);
-            const plus = await this.readLine(reader);
-            const qual = await this.readLine(reader);
-            
-            records.push({
-                id: id,
-                seq: seq,
-                plus: plus,
-                qual: qual
-            });
+        // 나머지 레코드들을 정확한 FASTQ 파싱으로 읽기
+        while (records.length < recordCount) {
+            const record = await this.readSingleFastqRecord(reader);
+            if (!record) break; // EOF
+            records.push(record);
         }
         
         console.log(`📖 워커 ${this.workerId}: ${records.length}개 레코드 읽기 완료`);
         return records;
+    }
+    
+    // 정확한 FASTQ 레코드 파싱 (synchronized-chunking-worker.js와 동일한 로직)
+    async readSingleFastqRecord(reader, headerLine = null) {
+        // 1단계: '@'로 시작하는 헤더 라인 찾기
+        let id = headerLine || await this.readLine(reader);
+        if (id === "") return null; // EOF
+        
+        // '@' 헤더가 아니면 다음 '@' 헤더 찾기
+        while (!id.startsWith('@')) {
+            id = await this.readLine(reader);
+            if (id === "") return null; // EOF
+        }
+        
+        // 2단계: 시퀀스 라인들 모두 읽기 ('+'가 나올 때까지)
+        let sequenceLines = [];
+        let line = await this.readLine(reader);
+        if (line === "") return null; // EOF
+        
+        while (!line.startsWith('+')) {
+            sequenceLines.push(line);
+            line = await this.readLine(reader);
+            if (line === "") return null; // EOF
+        }
+        
+        const plus = line; // '+' 라인
+        const seq = sequenceLines.join(''); // 시퀀스 합치기
+        
+        // 3단계: 품질 점수 라인들 읽기 (시퀀스와 같은 길이까지)
+        const totalSequenceLength = seq.length;
+        let qualityLines = [];
+        let qualityLength = 0;
+        
+        while (qualityLength < totalSequenceLength) {
+            const qualityLine = await this.readLine(reader);
+            if (qualityLine === "") return null; // EOF
+            qualityLines.push(qualityLine);
+            qualityLength += qualityLine.length;
+        }
+        
+        const qual = qualityLines.join(''); // 품질 점수 합치기
+        
+        return {
+            id: id,
+            seq: seq,
+            plus: plus,
+            qual: qual
+        };
     }
     
     // 청크 처리 메인 함수
@@ -684,13 +820,78 @@ class PullBasedProcessingWorker {
             .map(([sequence, count]) => ({ sequence, count }))
             .sort((a, b) => b.count - a.count);
     }
+    
+    // 🔧 SharedArrayBuffer/폴백 모드에서 청크 위치 정보 가져오기 (진정한 Pull 방식)
+    async dequeueChunk() {
+        if (this.sharedQueue) {
+            // SharedArrayBuffer 방식: 직접 큐에서 가져오기
+            return this.dequeueFromSharedBuffer();
+        } else {
+            // 폴백: 컨트롤러에게 Pull 요청 전송
+            return await this.requestChunkFromController();
+        }
+    }
+    
+    // SharedArrayBuffer에서 직접 큐 접근
+    dequeueFromSharedBuffer() {
+        const count = Atomics.load(this.sharedQueue, 2);
+        if (count === 0) {
+            this.queueEmpty = true;
+            return null; 
+        }
+        
+        const head = Atomics.load(this.sharedQueue, 0);
+        const maxSize = Atomics.load(this.sharedQueue, 3);
+        const baseIndex = 4 + (head * 6);
+        
+        const chunkInfo = {
+            chunkId: this.sharedQueue[baseIndex],
+            file1StartPos: (this.sharedQueue[baseIndex + 2] << 32) | this.sharedQueue[baseIndex + 1],
+            file2StartPos: (this.sharedQueue[baseIndex + 4] << 32) | this.sharedQueue[baseIndex + 3],
+            recordCount: this.sharedQueue[baseIndex + 5],
+            syncValidated: true,
+            timestamp: Date.now()
+        };
+        
+        Atomics.store(this.sharedQueue, 0, (head + 1) % maxSize);
+        Atomics.sub(this.sharedQueue, 2, 1);
+        
+        console.log(`🔽 워커 ${this.workerId}: SharedArrayBuffer에서 청크 ${chunkInfo.chunkId} Pull (남은: ${count - 1})`);
+        
+        this.queueEmpty = false;
+        return chunkInfo;
+    }
+    
+    // 컨트롤러에게 Pull 요청 전송 (폴백 모드) - 간소화
+    async requestChunkFromController() {
+        // Pull 요청 전송
+        self.postMessage({
+            type: 'pull_request',
+            workerId: this.workerId
+        });
+        
+        console.log(`🔽 워커 ${this.workerId}: 컨트롤러에게 Pull 요청 전송`);
+        
+        // 간소화: 응답을 전역 변수로 처리 (디버깅용)
+        return new Promise((resolve) => {
+            // 임시로 Promise 저장
+            this.pullPromiseResolve = resolve;
+            
+            // 5초 후 타임아웃
+            setTimeout(() => {
+                console.log(`⏰ 워커 ${this.workerId}: Pull 요청 타임아웃 (5초)`);
+                this.pullPromiseResolve = null;
+                resolve(null);
+            }, 5000);
+        });
+    }
 }
 
 // 워커 메인 로직
 const processor = new PullBasedProcessingWorker();
 
 self.addEventListener('message', async function(event) {
-    const { type, workerId, files, analysisParams, totalChunks, totalRecords, chunkInfo } = event.data;
+    const { type, workerId, files, analysisParams, totalChunks, totalRecords, chunkInfo, sharedBuffer } = event.data;
     
     if (type === 'start_processing') {
         // 워커 초기화
@@ -698,7 +899,24 @@ self.addEventListener('message', async function(event) {
         processor.files = files;
         processor.analysisParams = analysisParams;
         
-        console.log(`🚀 워커 ${workerId}: 처리 시작 준비 완료`);
+        const { mode, sharedBuffer } = event.data;
+        
+        if (mode === 'pull' && sharedBuffer) {
+            // Pull 모드: SharedArrayBuffer 설정 및 처리 루프 시작
+            processor.sharedQueue = new Int32Array(sharedBuffer);
+            
+            console.log(`🚀 워커 ${workerId}: Pull 모드 시작 준비 완료`);
+            console.log(`📋 워커 ${workerId}: SharedArrayBuffer 공유 큐 설정 완료`);
+            
+            // Pull 기반 처리 루프 시작
+            processor.startProcessingLoop(files, analysisParams);
+            
+        } else {
+            // Pull 모드 (폴백): BroadcastChannel 기반 처리 루프 시작
+            console.log(`🚀 워커 ${workerId}: Pull 모드 (폴백) 시작 준비 완료`);
+            // ✅ 폴백에서도 처리 루프 시작
+            processor.startProcessingLoop(files, analysisParams);
+        }
         
     } else if (type === 'process_chunk') {
         // 개별 청크 처리
@@ -721,5 +939,26 @@ self.addEventListener('message', async function(event) {
         processor.totalChunks = totalChunks;
         
         console.log(`📋 워커 ${processor.workerId}: 청킹 완료 알림 수신 (총 ${totalChunks}개 청크)`);
+        
+    } else if (type === 'chunk_info_response') {
+        // Pull 응답 수신 - 청크 정보
+        const { chunkInfo } = event.data;
+        console.log(`📥 워커 ${processor.workerId}: Pull 응답 수신 - 청크 ${chunkInfo.chunkId}`);
+        
+        // Promise 해결
+        if (processor.pullPromiseResolve) {
+            processor.pullPromiseResolve(chunkInfo);
+            processor.pullPromiseResolve = null;
+        }
+        
+    } else if (type === 'queue_empty') {
+        // Pull 응답 수신 - 큐 비어있음
+        console.log(`💤 워커 ${processor.workerId}: Pull 응답 수신 - 큐 비어있음`);
+        
+        // Promise 해결
+        if (processor.pullPromiseResolve) {
+            processor.pullPromiseResolve(null);
+            processor.pullPromiseResolve = null;
+        }
     }
 });
