@@ -115,6 +115,13 @@ class SynchronizedChunkingWorker {
         let recordCount = 0;
         let chunkId = 0;
         
+        // 진행률 계산을 위한 파일 크기 정보
+        const totalFileSize = file1.size + file2.size;
+        let lastProgressUpdate = 0;
+        const progressUpdateInterval = 50000; // 5만 레코드마다 진행률 업데이트
+        
+        console.log(`📊 청킹 시작: 총 파일 크기 ${(totalFileSize / 1024 / 1024).toFixed(1)}MB`);
+        
         this.initializeSharedQueue();
         
         // 🔧 큐 방식에 따라 다른 메시지 전송
@@ -164,6 +171,24 @@ class SynchronizedChunkingWorker {
                 
                 chunkRecordCount++;
                 recordCount++;
+                
+                // 진행률 업데이트 (5만 레코드마다)
+                if (recordCount - lastProgressUpdate >= progressUpdateInterval) {
+                    const currentPos = reader1.fpos + reader2.fpos;
+                    const chunkingProgress = Math.min(100, (currentPos / totalFileSize) * 100);
+                    
+                    // 메인 스레드로 청킹 진행률 전송
+                    self.postMessage({
+                        type: 'chunking_progress',
+                        progress: chunkingProgress,
+                        processedRecords: recordCount,
+                        currentChunks: chunkId + 1,
+                        estimatedTotalChunks: Math.ceil((totalFileSize / currentPos) * (chunkId + 1))
+                    });
+                    
+                    console.log(`📈 청킹 진행률: ${chunkingProgress.toFixed(1)}% (${recordCount}개 레코드, ${chunkId + 1}개 청크)`);
+                    lastProgressUpdate = recordCount;
+                }
             }
             
             if (chunkRecordCount === 0) break; // EOF 도달

@@ -210,6 +210,19 @@ export class PullBasedAptaSelectController {
             const { chunkInfo } = event.data;
             this.distributeChunkToWorker(chunkInfo);
             
+        } else if (type === 'chunking_progress') {
+            // 청킹 진행률 업데이트
+            const { progress, processedRecords, currentChunks, estimatedTotalChunks } = event.data;
+            console.log(`📈 청킹 진행률 업데이트: ${progress.toFixed(1)}% (${processedRecords}개 레코드, ${currentChunks}개 청크)`);
+            
+            this.updateProgress('chunking', progress);
+            this.processedChunks = Math.max(this.processedChunks || 0, currentChunks);
+            
+            // 추정 총 청크 수 업데이트 (더 정확한 값이 있으면)
+            if (estimatedTotalChunks && estimatedTotalChunks > this.totalChunks) {
+                this.totalChunks = estimatedTotalChunks;
+            }
+            
         } else if (type === 'chunking_complete') {
             const { totalChunks, totalRecords } = event.data;
             this.totalChunks = totalChunks;
@@ -637,19 +650,42 @@ export class PullBasedAptaSelectController {
         return limit === -1 ? sorted : sorted.slice(0, limit);
     }
     
-    // 진행률 업데이트 (CLAUDE.md 사양 구현)
+    // 진행률 업데이트 (전체 파일 기준으로 수정)
     updateProgress(stage, value) {
         this.progress[stage] = value;
+        this.lastProgressTime = Date.now();
         
-        // CLAUDE.md 진행률 개선 방안 구현: 30% 청킹, 70% 처리
-        if (stage === 'chunking') {
-            // 청킹은 전체의 30%
-            this.progress.overall = Math.min(30, value * 0.3);
-        } else if (stage === 'processing') {
-            // 처리는 전체의 70% (30%부터 시작)
-            this.progress.overall = 30 + Math.min(70, value * 0.7);
+        // 전체 진행률 계산 (청킹과 처리 동시 고려)
+        this.progress.overall = this.calculateOverallProgress();
+        
+        // 각 단계별 진행률을 전체 파일 기준으로 계산 (수정)
+        const progressInfo = this.createProgressInfo();
+        
+        if (this.onProgressUpdate) {
+            this.onProgressUpdate(progressInfo);
         }
         
+        console.log(`📊 진행률 업데이트 [${stage}]: ${value.toFixed(1)}% → 전체: ${this.progress.overall.toFixed(1)}%`);
+    }
+    
+    // 전체 진행률을 더 정교하게 계산
+    calculateOverallProgress() {
+        const chunkingPercent = this.progress.chunking || 0;
+        const processingPercent = this.progress.processing || 0;
+        
+        // Pull 기반에서는 청킹과 처리가 동시 진행
+        // 청킹이 완료되지 않았으면 청킹 진행률을 기준으로 계산
+        if (chunkingPercent < 100) {
+            // 청킹 중: 청킹 진행률 × 0.6 + 처리 진행률 × 0.4
+            return Math.min(100, chunkingPercent * 0.6 + processingPercent * 0.4);
+        } else {
+            // 청킹 완료: 60% + 처리 진행률 × 0.4
+            return Math.min(100, 60 + processingPercent * 0.4);
+        }
+    }
+    
+    // 실시간 처리 속도 계산 및 progressInfo 생성 (updateProgress에서 분리)
+    createProgressInfo() {
         // 실시간 처리 속도 계산
         const now = Date.now();
         if (this.lastProgressUpdate && this.processedChunks > 0) {
@@ -671,9 +707,42 @@ export class PullBasedAptaSelectController {
             }
         }
         
+        // 전체 파일에서 각 단계가 차지하는 비중:
+        // 청킹: 60%, 조인: 16%, 선택: 12%, 정렬1: 8%, 정렬2: 3%, 집계: 1%
+        
+        const chunkingPercent = this.progress.chunking || 0;
+        const processingPercent = this.progress.processing || 0;
+        
+        // 각 처리 단계별 가중치 (processing 40% 내에서 분배)
+        const processingWeights = {
+            joining: 0.4,    // 조인: 40% (16%/40%)
+            selecting: 0.3,  // 선택: 30% (12%/40%) 
+            sorting1: 0.2,   // 정렬1: 20% (8%/40%)
+            sorting2: 0.075, // 정렬2: 7.5% (3%/40%)
+            aggregating: 0.025 // 집계: 2.5% (1%/40%)
+        };
+        
+        // 전체 파일 기준 각 단계 진행률 계산
+        const fileBasedProgress = {
+            chunking: chunkingPercent * 0.6,  // 전체의 60%
+            joining: processingPercent * processingWeights.joining * 0.4,
+            selecting: processingPercent * processingWeights.selecting * 0.4,
+            sorting1: processingPercent * processingWeights.sorting1 * 0.4,
+            sorting2: processingPercent * processingWeights.sorting2 * 0.4,
+            aggregating: processingPercent * processingWeights.aggregating * 0.4
+        };
+        
         // 추가 정보 계산 (CLAUDE.md 개선사항 포함)
-        const progressInfo = {
+        return {
+            // 원본 진행률 (기존 호환성)
             ...this.progress,
+            
+            // 전체 파일 기준 단계별 진행률 (새로 추가)
+            stageProgress: fileBasedProgress,
+            
+            // 각 단계별 진행률을 명시적으로 전달
+            chunking: this.progress.chunking || 0,
+            processing: this.progress.processing || 0,
             busyWorkers: this.getActiveWorkersCount(), // Pull 기반에서는 하트비트로 계산
             totalWorkers: this.processingWorkers.length,
             processedChunks: this.processedChunks,
@@ -681,14 +750,18 @@ export class PullBasedAptaSelectController {
             completedWorkers: this.completedWorkers.size,
             processingSpeed: this.processingSpeed || 0,
             estimatedTimeRemaining: estimatedTimeRemaining,
-            // 청킹 단계에서의 세분화된 상태
-            isChunking: stage === 'chunking' && value < 100,
-            isProcessing: (stage === 'processing' && value < 100) || (this.chunkingComplete && this.processedChunks < this.totalChunks && !this.isAnalysisComplete)
+            
+            // 상태 정보
+            isChunking: chunkingPercent < 100,
+            isProcessing: this.busyWorkers.size > 0,
+            
+            // 디버그 정보
+            debug: {
+                rawChunking: chunkingPercent,
+                rawProcessing: processingPercent,
+                weights: processingWeights
+            }
         };
-        
-        if (this.onProgressUpdate) {
-            this.onProgressUpdate(progressInfo);
-        }
     }
     
     // 카운트 초기화 (완료 추적 변수 포함)

@@ -9,6 +9,16 @@
     let isChunking = false;   // 청킹 상태 플래그
     let processingMode = "";  // 처리 모드 (pull-based vs legacy)
     let validationStats = null; // 검증 통계
+    
+    // 단계별 진행률
+    let stageProgress = {
+        chunking: 0,        // 청킹 진행률
+        joining: 0,         // 시퀀스 조인 진행률  
+        selecting: 0,       // 선택 필터링 진행률
+        sorting1: 0,        // 1차 정렬 진행률
+        sorting2: 0,        // 2차 정렬 진행률
+        aggregating: 0      // 집계 진행률
+    };
 
     let sel_read1, sel_read2, s1_read1, s1_read2, s1_l, s2_read1, s2_read2, s2_l, read1, read2;
     let fs;
@@ -132,6 +142,16 @@
             sel_count = 0;
             s1_count = 0;
             s2_count = 0;
+            
+            // 단계별 진행률 초기화
+            stageProgress = {
+                chunking: 0,
+                joining: 0,
+                selecting: 0,
+                sorting1: 0,
+                sorting2: 0,
+                aggregating: 0
+            };
 
             // 컨트롤러 초기화
             controller = new AptaSelectController();
@@ -144,6 +164,34 @@
             // 콜백 설정 (CLAUDE.md 진행률 개선사항 구현)
             controller.onProgressUpdate = (progressInfo) => {
                 progress = Math.round(progressInfo.overall);
+                
+                // 단계별 세부 진행률 업데이트
+                stageProgress.chunking = progressInfo.chunking || 0;
+                
+                // 컨트롤러에서 계산된 단계별 진행률 사용 (전체 파일 기준)
+                if (progressInfo.stageProgress) {
+                    stageProgress.chunking = progressInfo.stageProgress.chunking || 0;
+                    stageProgress.joining = progressInfo.stageProgress.joining || 0;
+                    stageProgress.selecting = progressInfo.stageProgress.selecting || 0;
+                    stageProgress.sorting1 = progressInfo.stageProgress.sorting1 || 0;
+                    stageProgress.sorting2 = progressInfo.stageProgress.sorting2 || 0;
+                    stageProgress.aggregating = progressInfo.stageProgress.aggregating || 0;
+                    
+                    console.log(`📊 전체 파일 기준 단계별 진행률: 청킹=${stageProgress.chunking.toFixed(1)}%, 조인=${stageProgress.joining.toFixed(1)}%, 선택=${stageProgress.selecting.toFixed(1)}%, 정렬1=${stageProgress.sorting1.toFixed(1)}%, 정렬2=${stageProgress.sorting2.toFixed(1)}%, 집계=${stageProgress.aggregating.toFixed(1)}%`);
+                } else {
+                    // 폴백: 기존 계산 로직 (하위 호환성)
+                    const chunkingPercent = progressInfo.chunking || 0;
+                    const processingPercent = progressInfo.processing || 0;
+                    
+                    stageProgress.chunking = chunkingPercent * 0.6;
+                    stageProgress.joining = processingPercent * 0.4 * 0.4;    // 처리의 40%
+                    stageProgress.selecting = processingPercent * 0.4 * 0.3;  // 처리의 30%
+                    stageProgress.sorting1 = processingPercent * 0.4 * 0.2;   // 처리의 20%
+                    stageProgress.sorting2 = processingPercent * 0.4 * 0.075; // 처리의 7.5%
+                    stageProgress.aggregating = processingPercent * 0.4 * 0.025; // 처리의 2.5%
+                    
+                    console.log(`📊 폴백 계산 - 전체 파일 기준 단계별 진행률: 청킹=${stageProgress.chunking.toFixed(1)}%, 조인=${stageProgress.joining.toFixed(1)}%, 선택=${stageProgress.selecting.toFixed(1)}%, 정렬1=${stageProgress.sorting1.toFixed(1)}%, 정렬2=${stageProgress.sorting2.toFixed(1)}%, 집계=${stageProgress.aggregating.toFixed(1)}%`);
+                }
                 
                 // 각 단계에 맞는 세분화된 진행률 표시 개선
                 if (progressInfo.isChunking) {
@@ -403,14 +451,159 @@
         {#if validationStats}
             <p class="text-sm text-gray-600">Paired-read 검증: {validationStats.validRecords}/{validationStats.totalRecords} (오류율: {validationStats.errorRate})</p>
         {/if}
-        <br><br>
-        <Progressbar
-            {progress}
-            animate
-            labelInside
-            size="h-6"
-            labelInsideClass="bg-blue-600 text-blue-100 text-base font-medium text-center p-1 leading-none rounded-full"
-        />
+        <br>
+        
+        <!-- 전체 진행률 -->
+        <div class="mb-4">
+            <div class="flex justify-between mb-1">
+                <span class="text-base font-medium text-blue-700">전체 진행률</span>
+                <span class="text-sm font-medium text-blue-700">{progress}%</span>
+            </div>
+            <Progressbar
+                {progress}
+                animate
+                labelInside
+                size="h-6"
+                labelInsideClass="bg-blue-600 text-blue-100 text-base font-medium text-center p-1 leading-none rounded-full"
+            />
+        </div>
+
+        <!-- 단계별 세부 진행률 -->
+        <div class="space-y-3 bg-gray-50 p-4 rounded-lg">
+            <h3 class="text-lg font-semibold text-gray-800 mb-3">단계별 진행률</h3>
+            
+            <!-- 청킹 단계 (전체 파일의 60%) -->
+            <div class="space-y-1" class:opacity-60={stageProgress.chunking === 100}>
+                <div class="flex justify-between text-sm">
+                    <span class="font-medium" class:text-indigo-700={stageProgress.chunking > 0 && stageProgress.chunking < 100} class:text-gray-500={stageProgress.chunking === 0 || stageProgress.chunking === 100}>
+                        1. 파일 분석 (청킹) - 전체의 60%
+                        {#if stageProgress.chunking > 0 && stageProgress.chunking < 100}
+                            <span class="inline-block w-2 h-2 bg-indigo-500 rounded-full ml-2 animate-pulse"></span>
+                        {:else if stageProgress.chunking === 100}
+                            <span class="text-green-600 ml-1">✓</span>
+                        {/if}
+                    </span>
+                    <span class="text-gray-600">{Math.round(stageProgress.chunking)}%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2">
+                    <div 
+                        class="bg-indigo-500 h-2 rounded-full transition-all duration-300 ease-out"
+                        class:animate-pulse={stageProgress.chunking > 0 && stageProgress.chunking < 100}
+                        style="width: {stageProgress.chunking}%"
+                    ></div>
+                </div>
+            </div>
+
+            <!-- 조인 단계 (전체 파일의 16%) -->
+            <div class="space-y-1" class:opacity-60={stageProgress.joining === 100}>
+                <div class="flex justify-between text-sm">
+                    <span class="font-medium" class:text-purple-700={stageProgress.joining > 0 && stageProgress.joining < 100} class:text-gray-500={stageProgress.joining === 0 || stageProgress.joining === 100}>
+                        2. 시퀀스 조인 - 전체의 16%
+                        {#if stageProgress.joining > 0 && stageProgress.joining < 100}
+                            <span class="inline-block w-2 h-2 bg-purple-500 rounded-full ml-2 animate-pulse"></span>
+                        {:else if stageProgress.joining === 100}
+                            <span class="text-green-600 ml-1">✓</span>
+                        {/if}
+                    </span>
+                    <span class="text-gray-600">{Math.round(stageProgress.joining)}%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2">
+                    <div 
+                        class="bg-purple-500 h-2 rounded-full transition-all duration-300 ease-out"
+                        class:animate-pulse={stageProgress.joining > 0 && stageProgress.joining < 100}
+                        style="width: {stageProgress.joining}%"
+                    ></div>
+                </div>
+            </div>
+
+            <!-- 선택 필터링 단계 (전체 파일의 12%) -->
+            <div class="space-y-1" class:opacity-60={stageProgress.selecting === 100}>
+                <div class="flex justify-between text-sm">
+                    <span class="font-medium" class:text-green-700={stageProgress.selecting > 0 && stageProgress.selecting < 100} class:text-gray-500={stageProgress.selecting === 0 || stageProgress.selecting === 100}>
+                        3. 선택 필터링 - 전체의 12%
+                        {#if stageProgress.selecting > 0 && stageProgress.selecting < 100}
+                            <span class="inline-block w-2 h-2 bg-green-500 rounded-full ml-2 animate-pulse"></span>
+                        {:else if stageProgress.selecting === 100}
+                            <span class="text-green-600 ml-1">✓</span>
+                        {/if}
+                    </span>
+                    <span class="text-gray-600">{Math.round(stageProgress.selecting)}%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2">
+                    <div 
+                        class="bg-green-500 h-2 rounded-full transition-all duration-300 ease-out"
+                        class:animate-pulse={stageProgress.selecting > 0 && stageProgress.selecting < 100}
+                        style="width: {stageProgress.selecting}%"
+                    ></div>
+                </div>
+            </div>
+
+            <!-- 1차 정렬 단계 (전체 파일의 8%) -->
+            <div class="space-y-1" class:opacity-60={stageProgress.sorting1 === 100}>
+                <div class="flex justify-between text-sm">
+                    <span class="font-medium" class:text-yellow-700={stageProgress.sorting1 > 0 && stageProgress.sorting1 < 100} class:text-gray-500={stageProgress.sorting1 === 0 || stageProgress.sorting1 === 100}>
+                        4. 1차 정렬 필터링 - 전체의 8%
+                        {#if stageProgress.sorting1 > 0 && stageProgress.sorting1 < 100}
+                            <span class="inline-block w-2 h-2 bg-yellow-500 rounded-full ml-2 animate-pulse"></span>
+                        {:else if stageProgress.sorting1 === 100}
+                            <span class="text-green-600 ml-1">✓</span>
+                        {/if}
+                    </span>
+                    <span class="text-gray-600">{Math.round(stageProgress.sorting1)}%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2">
+                    <div 
+                        class="bg-yellow-500 h-2 rounded-full transition-all duration-300 ease-out"
+                        class:animate-pulse={stageProgress.sorting1 > 0 && stageProgress.sorting1 < 100}
+                        style="width: {stageProgress.sorting1}%"
+                    ></div>
+                </div>
+            </div>
+
+            <!-- 2차 정렬 단계 (전체 파일의 3%) -->
+            <div class="space-y-1" class:opacity-60={stageProgress.sorting2 === 100}>
+                <div class="flex justify-between text-sm">
+                    <span class="font-medium" class:text-orange-700={stageProgress.sorting2 > 0 && stageProgress.sorting2 < 100} class:text-gray-500={stageProgress.sorting2 === 0 || stageProgress.sorting2 === 100}>
+                        5. 2차 정렬 필터링 - 전체의 3%
+                        {#if stageProgress.sorting2 > 0 && stageProgress.sorting2 < 100}
+                            <span class="inline-block w-2 h-2 bg-orange-500 rounded-full ml-2 animate-pulse"></span>
+                        {:else if stageProgress.sorting2 === 100}
+                            <span class="text-green-600 ml-1">✓</span>
+                        {/if}
+                    </span>
+                    <span class="text-gray-600">{Math.round(stageProgress.sorting2)}%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2">
+                    <div 
+                        class="bg-orange-500 h-2 rounded-full transition-all duration-300 ease-out"
+                        class:animate-pulse={stageProgress.sorting2 > 0 && stageProgress.sorting2 < 100}
+                        style="width: {stageProgress.sorting2}%"
+                    ></div>
+                </div>
+            </div>
+
+            <!-- 집계 단계 (전체 파일의 1%) -->
+            <div class="space-y-1" class:opacity-60={stageProgress.aggregating === 100}>
+                <div class="flex justify-between text-sm">
+                    <span class="font-medium" class:text-red-700={stageProgress.aggregating > 0 && stageProgress.aggregating < 100} class:text-gray-500={stageProgress.aggregating === 0 || stageProgress.aggregating === 100}>
+                        6. 결과 집계 - 전체의 1%
+                        {#if stageProgress.aggregating > 0 && stageProgress.aggregating < 100}
+                            <span class="inline-block w-2 h-2 bg-red-500 rounded-full ml-2 animate-pulse"></span>
+                        {:else if stageProgress.aggregating === 100}
+                            <span class="text-green-600 ml-1">✓</span>
+                        {/if}
+                    </span>
+                    <span class="text-gray-600">{Math.round(stageProgress.aggregating)}%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2">
+                    <div 
+                        class="bg-red-500 h-2 rounded-full transition-all duration-300 ease-out"
+                        class:animate-pulse={stageProgress.aggregating > 0 && stageProgress.aggregating < 100}
+                        style="width: {stageProgress.aggregating}%"
+                    ></div>
+                </div>
+            </div>
+        </div>
     {:else if status === 2}
         <p>Analysis is complete!</p>
         {#if processingMode}
